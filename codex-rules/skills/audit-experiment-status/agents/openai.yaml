@@ -1,0 +1,4 @@
+interface:
+  display_name: "审计实验状态"
+  short_description: "只读核查科研实验的进程、GPU、日志、输出覆盖与完成状态"
+  default_prompt: "使用 $audit-experiment-status 只读核查当前实验的真实运行与完成状态。"

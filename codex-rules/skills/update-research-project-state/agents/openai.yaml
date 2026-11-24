@@ -1,0 +1,4 @@
+interface:
+  display_name: "更新科研项目状态"
+  short_description: "更新已核验的科研项目状态，并在明确要求时整理当前接手入口、状态和历史资料"
+  default_prompt: "使用 $update-research-project-state 将本轮已确认事实更新到 PROJECT_STATE.md。"

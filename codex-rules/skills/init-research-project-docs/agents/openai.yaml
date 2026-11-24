@@ -1,0 +1,4 @@
+interface:
+  display_name: "初始化科研项目文档"
+  short_description: "为科研仓库创建简洁的中文项目说明、项目状态与实验历程文档"
+  default_prompt: "使用 $init-research-project-docs 初始化当前科研项目的中文项目说明与状态文档。"

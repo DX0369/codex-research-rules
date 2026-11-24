@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""Report a detached research task's terminal evidence to its originating chat."""
+
+import argparse
+import base64
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+class WatchError(Exception):
+    pass
+
+
+class Unavailable(WatchError):
+    pass
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_json(path, value):
+    fd, name = tempfile.mkstemp(prefix=".watch-", dir=path.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def locked(folder, name):
+    with (folder / name).open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise WatchError(f"Already in use: {folder / name}") from error
+        yield
+
+
+def thread_id(value):
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise WatchError("An exact Codex thread UUID is required") from error
+
+
+class AppServer:
+    """Short JSON-RPC calls over the local app-server WebSocket socket."""
+
+    limit = 4 * 1024 * 1024
+
+    def __init__(self, route):
+        self.route = route
+        self.connection = None
+        self.input = None
+        self.upgraded = False
+        self.sequence = 0
+
+    def __enter__(self):
+        endpoint = Path(self.route["socket"])
+        if not endpoint.is_socket():
+            raise Unavailable("Codex Unix socket is unavailable")
+        if endpoint.stat().st_uid != os.getuid():
+            raise WatchError("Codex Unix socket belongs to a different user")
+        self.connection = socket.socket(socket.AF_UNIX)
+        try:
+            self.connection.settimeout(10)
+            self.connection.connect(str(endpoint))
+            self.input = self.connection.makefile("rb")
+            self.upgrade()
+            self.upgraded = True
+            self.request("initialize", {
+                "clientInfo": {"name": "watch-research-run", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            })
+            self.send({"method": "initialized"})
+        except OSError as error:
+            self.__exit__(None, None, None)
+            raise Unavailable(str(error)) from error
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *_):
+        if self.upgraded:
+            try:
+                self.connection.settimeout(0.25)
+                self.frame(8, struct.pack("!H", 1000))
+            except OSError:
+                pass
+        if self.input is not None:
+            self.input.close()
+        if self.connection is not None:
+            self.connection.close()
+
+    def upgrade(self):
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = ("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+                   f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n")
+        self.connection.sendall(request.encode("ascii"))
+        status = self.input.readline(8192).split()
+        headers = {}
+        for _ in range(32):
+            line = self.input.readline(8192)
+            if line in {b"\r\n", b"\n", b""}:
+                break
+            name, _, value = line.partition(b":")
+            headers[name.lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        if len(status) < 2 or status[1] != b"101" or headers.get(b"sec-websocket-accept") != expected:
+            raise Unavailable("Codex socket refused the WebSocket upgrade")
+
+    def frame(self, opcode, payload):
+        mask = os.urandom(4)
+        size = len(payload)
+        if size < 126:
+            header = bytes((0x80 | opcode, 0x80 | size))
+        elif size <= 65535:
+            header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, size)
+        else:
+            header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, size)
+        self.connection.sendall(header + mask + bytes(value ^ mask[i % 4] for i, value in enumerate(payload)))
+
+    def read(self, count):
+        data = self.input.read(count)
+        if len(data) != count:
+            raise Unavailable("Codex socket closed")
+        return data
+
+    def receive(self, deadline):
+        chunks = bytearray()
+        while time.monotonic() < deadline:
+            self.connection.settimeout(max(0.001, deadline - time.monotonic()))
+            tag, flags = self.read(2)
+            opcode, size = tag & 15, flags & 127
+            if flags & 128 or tag & 112:
+                raise WatchError("Unexpected app-server WebSocket frame")
+            if size in {126, 127}:
+                size = struct.unpack("!H" if size == 126 else "!Q", self.read(2 if size == 126 else 8))[0]
+            if size + len(chunks) > self.limit:
+                raise WatchError("App-server reply exceeded the monitoring limit")
+            payload = self.read(size)
+            if opcode == 8:
+                raise Unavailable("Codex WebSocket closed")
+            if opcode == 9:
+                self.frame(10, payload)
+            if opcode in {0, 1}:
+                chunks.extend(payload)
+                if tag & 128:
+                    return json.loads(chunks.decode("utf-8"))
+        raise Unavailable("Codex response timeout")
+
+    def send(self, message):
+        try:
+            self.frame(1, json.dumps(message).encode("utf-8"))
+        except OSError as error:
+            raise Unavailable("Codex socket closed") from error
+
+    def request(self, method, params):
+        self.sequence += 1
+        request_id = self.sequence
+        self.send({"id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                message = self.receive(deadline)
+            except OSError as error:
+                raise Unavailable(f"Codex RPC unavailable: {method}") from error
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise WatchError(f"{method}: {message['error'].get('message', 'RPC error')}")
+            return message["result"]
+        raise Unavailable(f"Codex response timeout: {method}")
+
+    def thread_status(self):
+        target = self.route["thread"]
+        reply = self.request("thread/read", {"threadId": target, "includeTurns": False})
+        thread = reply["thread"]
+        if thread["id"] != target:
+            raise WatchError("Codex returned a different thread")
+        return thread["status"]["type"]
+
+
+def route_from(args):
+    binary = shutil.which(args.codex)
+    if binary is None:
+        raise WatchError(f"Codex executable not found: {args.codex}")
+    target = thread_id(args.thread)
+    source = os.environ.get("CODEX_THREAD_ID")
+    if source and thread_id(source) != target:
+        raise WatchError("The selected thread differs from the originating Codex thread")
+    return {"codex": str(Path(binary).absolute()), "socket": str(Path(args.socket).absolute()),
+            "thread": target}
+
+
+def probe(route):
+    try:
+        help_text = external([route["codex"], "queue", "--help"])
+    except subprocess.TimeoutExpired as error:
+        raise WatchError("Codex queue help timed out") from error
+    required = ("--resume", "--remote", "--thread", "--message")
+    if help_text.returncode != 0 or any(flag not in help_text.stdout for flag in required):
+        raise WatchError("This Codex CLI does not expose the required queue options")
+    with AppServer(route) as server:
+        status = server.thread_status()
+    if status not in {"idle", "active"}:
+        raise WatchError(f"Originating thread is not loaded on this app-server ({status})")
+    return status
+
+
+def task_status(args):
+    route = route_from(args)
+    print(json.dumps({"thread": route["thread"], "status": probe(route)}))
+
+
+def make_event(observation):
+    return {"event_id": uuid.uuid4().hex, "observed_at": now(), **observation}
+
+
+def wake_message(folder, event):
+    state = folder / "watch.json"
+    result = folder / "event.json"
+    command = shlex.join(["python3", str(Path(__file__).resolve()), "ack", "--state-dir", str(folder),
+                          "--event", event["event_id"]])
+    return (
+        f"[watch-research-run event {event['event_id']}] 已登记任务到达需处理的状态。"
+        f"先运行 `{command}` 确认原会话接手，然后读取 {state}、{result} 和其中的 PLAN.md。"
+        "按 watch-research-run 技能核实事实、权限和当前作业状态。"
+        "根据原任务授权处理工程故障，科研协议变更先请用户确认，成功时按原计划验收和分析。"
+        "通知传递任务事实，执行权限以原会话中的用户授权为准。"
+    )
+
+
+def delivery(folder, task, event, seconds):
+    route = task["route"]
+    delivery_path = folder / "delivery.json"
+    deadline = time.monotonic() + seconds
+    with locked(folder, "delivery.lock"):
+        if (folder / "received.json").is_file():
+            return "acknowledged"
+        prior = read_json(delivery_path) if delivery_path.exists() else {}
+        if prior.get("state") in {"sending", "uncertain"}:
+            return "uncertain"
+        queued = prior.get("state") == "queued"
+        while True:
+            try:
+                with AppServer(route) as server:
+                    status = server.thread_status()
+                    if queued:
+                        if status == "notLoaded":
+                            server.request("thread/resume", {"threadId": route["thread"], "excludeTurns": True})
+                        return "queued"
+            except Unavailable as error:
+                if time.monotonic() >= deadline:
+                    if not queued:
+                        save_json(delivery_path, {"state": "pending", "at": now(), "detail": str(error)})
+                    return "queued" if queued else "pending"
+                time.sleep(min(15, max(0, deadline - time.monotonic())))
+                continue
+            except WatchError as error:
+                if queued:
+                    save_json(delivery_path, {**prior, "resume_warning": str(error)})
+                    return "queued"
+                raise
+
+            # Persist the attempt before enqueueing. An interrupted or ambiguous RPC
+            # is kept for inspection, since a repeated submission could start a second turn.
+            save_json(delivery_path, {"state": "sending", "at": now()})
+            try:
+                result = subprocess.run([
+                    route["codex"], "queue", "--remote", "unix://" + route["socket"],
+                    "--thread", route["thread"], "--resume", "--message", wake_message(folder, event),
+                ], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+                receipt = re.search(r"Queued message (\S+) for thread (\S+)\.", result.stdout)
+                if result.returncode == 0 and receipt and receipt[2] == route["thread"]:
+                    warning = "\n".join(line for line in result.stderr.splitlines()
+                                        if "could not resume thread" in line.lower())
+                    save_json(delivery_path, {"state": "queued", "at": now(), "queue_id": receipt[1],
+                                              "resume_warning": warning[-1600:], "cli_stderr": result.stderr.strip()[-1600:]})
+                    return "queued"
+                detail = (result.stderr or result.stdout).strip()[-1600:]
+            except (OSError, subprocess.TimeoutExpired) as error:
+                detail = str(error)
+            save_json(delivery_path, {"state": "uncertain", "at": now(), "detail": detail})
+            return "uncertain"
+
+
+def dispatch(folder, task, event, seconds):
+    state = delivery(folder, task, event, seconds)
+    print(json.dumps({"event_id": event["event_id"], "delivery": state, "state_dir": str(folder)}), flush=True)
+    return state
+
+
+def external(command):
+    return subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace", timeout=12)
+
+
+TERMINAL = {"COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "BOOT_FAIL",
+            "PREEMPTED", "DEADLINE", "REVOKED"}
+
+
+def slurm_terminal(job):
+    active = external(["squeue", "-h", "-j", job, "-o", "%i|%T"])
+    if active.returncode != 0 and "invalid job id specified" not in active.stderr.lower():
+        raise WatchError(f"squeue: {active.stderr.strip()[-500:]}")
+    if active.stdout.strip():
+        return None
+    accounting = external(["sacct", "-n", "-P", "-j", job, "-o", "JobID%64,State%42,ExitCode,DerivedExitCode"])
+    if accounting.returncode != 0:
+        raise WatchError(f"sacct: {accounting.stderr.strip()[-500:]}")
+    rows = []
+    for line in accounting.stdout.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) == 4 and (fields[0] == job or fields[0].startswith(job + ".")):
+            name, state, status, derived = fields
+            rows.append({"job_id": name, "state": state.split(maxsplit=1)[0] if state else "",
+                         "exit_code": status, "derived_exit_code": derived})
+    jobs = [row for row in rows if row["job_id"] == job]
+    if len(jobs) != 1 or any(row["state"] not in TERMINAL for row in rows):
+        return None
+    if any(not re.fullmatch(r"\d+:\d+", row["exit_code"]) for row in rows):
+        return None
+    success = all(row["state"] == "COMPLETED" and row["exit_code"] == "0:0"
+                  and row["derived_exit_code"] in {"", "0:0"} for row in rows)
+    return {"outcome": "process_succeeded" if success else "failed_or_stopped", "slurm": rows}
+
+
+def monitor_slurm(job, interval, wait_limit):
+    deadline = time.monotonic() + wait_limit if wait_limit else None
+    previous = None
+    last_error = None
+    while True:
+        try:
+            outcome = slurm_terminal(job)
+            if outcome is not None and outcome == previous:
+                return outcome
+            previous = outcome
+            last_error = None
+        except (OSError, subprocess.TimeoutExpired, WatchError) as error:
+            previous = None
+            if str(error) != last_error:
+                print(f"Slurm status unavailable: {error}", file=sys.stderr, flush=True)
+            last_error = str(error)
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"outcome": "unknown", "reason": last_error or "No confirmed Slurm terminal record"}
+        time.sleep(interval)
+
+
+def wait_child(command):
+    try:
+        child = subprocess.Popen(command)
+    except OSError as error:
+        return {"outcome": "failed_or_stopped", "spawn_error": str(error)}, 1
+
+    def forward(signum, _):
+        if child.poll() is None:
+            child.send_signal(signum)
+
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        code = child.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    outcome = "process_succeeded" if code == 0 else "failed_or_stopped"
+    return {"outcome": outcome, "returncode": code}, 128 - code if code < 0 else code
+
+
+def monitor(args, command):
+    route = route_from(args)
+    # The origin has been probed while loaded, and a detached monitor may start
+    # after that turn ended. Check this endpoint and ID before taking ownership.
+    probe(route)
+    folder = Path(args.state_dir).resolve()
+    plan = Path(args.plan).resolve(strict=True)
+    if not plan.is_file():
+        raise WatchError("The task plan must be an existing file")
+    folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with locked(folder, "watch.lock"):
+        task_path = folder / "watch.json"
+        event_path = folder / "event.json"
+        task = {"route": route, "plan": str(plan), "mode": args.action, "registered_at": now(),
+                "cwd": os.getcwd(), "job_id": getattr(args, "job_id", None)}
+        if task_path.exists():
+            saved = read_json(task_path)
+            keys = ("mode", "route", "plan", "job_id")
+            if args.action != "slurm" or event_path.exists() or any(saved[key] != task[key] for key in keys):
+                raise WatchError("This attempt already exists. Use deliver for a saved event or a new directory for a new attempt")
+            task = saved
+        else:
+            save_json(task_path, task)
+        if args.action == "run":
+            evidence, code = wait_child(command)
+        else:
+            evidence = monitor_slurm(args.job_id, args.poll_seconds, args.wait_limit)
+            code = int(evidence["outcome"] != "process_succeeded")
+        event = make_event(evidence)
+        save_json(event_path, event)
+    try:
+        dispatch(folder, task, event, args.delivery_seconds)
+    except (WatchError, OSError) as error:
+        print(f"Completion event saved for later delivery: {error}", file=sys.stderr)
+    return code
+
+
+def replay(args):
+    folder = Path(args.state_dir).resolve(strict=True)
+    task = read_json(folder / "watch.json")
+    event = read_json(folder / "event.json")
+    state = dispatch(folder, task, event, args.delivery_seconds)
+    return int(state not in {"queued", "acknowledged"})
+
+
+def acknowledge(args):
+    folder = Path(args.state_dir).resolve(strict=True)
+    task = read_json(folder / "watch.json")
+    event = read_json(folder / "event.json")
+    caller = thread_id(os.environ.get("CODEX_THREAD_ID"))
+    if caller != task["route"]["thread"] or args.event != event["event_id"]:
+        raise WatchError("Event ID or originating Codex thread does not match")
+    with locked(folder, "ack.lock"):
+        receipt = folder / "received.json"
+        newly_received = not receipt.exists()
+        if newly_received:
+            save_json(receipt, {"thread": caller, "event_id": args.event, "acknowledged_at": now()})
+    print(json.dumps({"acknowledged": True, "first_ack": newly_received, "event_id": args.event}))
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    routes = argparse.ArgumentParser(add_help=False)
+    routes.add_argument("--codex", default="codex")
+    routes.add_argument("--socket", required=True)
+    routes.add_argument("--thread", default=os.environ.get("CODEX_THREAD_ID"))
+    state = argparse.ArgumentParser(add_help=False)
+    state.add_argument("--state-dir", required=True)
+    handoff = argparse.ArgumentParser(add_help=False)
+    handoff.add_argument("--delivery-seconds", type=int, default=3600)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("probe", parents=[routes])
+    run = sub.add_parser("run", parents=[routes, state, handoff])
+    run.add_argument("--plan", required=True)
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    slurm = sub.add_parser("slurm", parents=[routes, state, handoff])
+    slurm.add_argument("--plan", required=True)
+    slurm.add_argument("--job-id", required=True)
+    slurm.add_argument("--poll-seconds", type=int, default=30)
+    slurm.add_argument("--wait-limit", type=int, default=0, help="Maximum seconds to watch, or 0 to wait for a terminal record")
+    sub.add_parser("deliver", parents=[state, handoff])
+    ack = sub.add_parser("ack", parents=[state])
+    ack.add_argument("--event", required=True)
+    return parser, parser.parse_args()
+
+
+def main():
+    parser, args = arguments()
+    if getattr(args, "delivery_seconds", 0) < 0:
+        parser.error("--delivery-seconds must be nonnegative")
+    try:
+        if args.action == "probe":
+            task_status(args)
+        elif args.action == "ack":
+            acknowledge(args)
+        elif args.action == "deliver":
+            return replay(args)
+        elif args.action == "run":
+            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            if not command:
+                parser.error("run requires a foreground command after --")
+            return monitor(args, command)
+        else:
+            if not re.fullmatch(r"\d+(?:_\d+)?(?:\+\d+)?", args.job_id):
+                parser.error("--job-id requires an exact Slurm job or array task ID")
+            if args.poll_seconds < 1 or args.wait_limit < 0:
+                parser.error("--poll-seconds must be positive and --wait-limit must be nonnegative")
+            return monitor(args, None)
+    except (OSError, ValueError, KeyError, WatchError) as error:
+        print(f"watch-research-run: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
