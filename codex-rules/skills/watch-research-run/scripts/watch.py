@@ -21,6 +21,9 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 
 class WatchError(Exception):
@@ -29,6 +32,10 @@ class WatchError(Exception):
 
 class Unavailable(WatchError):
     pass
+
+
+DELIVERY_SECONDS = 24 * 60 * 60
+CONTROL_SOCKET = "app-server-control/app-server-control.sock"
 
 
 def now():
@@ -209,16 +216,27 @@ class AppServer:
         return thread["status"]["type"]
 
 
-def route_from(args):
-    binary = shutil.which(args.codex)
-    if binary is None:
-        raise WatchError(f"Codex executable not found: {args.codex}")
+def origin_from(args):
     target = thread_id(args.thread)
     source = os.environ.get("CODEX_THREAD_ID")
     if source and thread_id(source) != target:
         raise WatchError("The selected thread differs from the originating Codex thread")
-    return {"codex": str(Path(binary).absolute()), "socket": str(Path(args.socket).absolute()),
-            "thread": target}
+    return target
+
+
+def route_from(args):
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+    codex = args.codex or shutil.which("codex") or home / "packages/standalone/current/bin/codex"
+    binary = shutil.which(codex)
+    if binary is None:
+        raise WatchError(f"Codex executable not found: {codex}")
+    endpoint = Path(args.socket).expanduser().absolute() if args.socket else home / CONTROL_SOCKET
+    if len(os.fsencode(endpoint)) > 107:
+        raise WatchError("Codex Unix socket path exceeds 107 bytes")
+    route = {"codex": str(Path(binary).absolute()), "socket": str(endpoint), "thread": origin_from(args)}
+    if args.socket is None:
+        route["managed_home"] = str(home)
+    return route
 
 
 def probe(route):
@@ -238,7 +256,7 @@ def probe(route):
 
 def task_status(args):
     route = route_from(args)
-    print(json.dumps({"thread": route["thread"], "status": probe(route)}))
+    print(json.dumps({**route, "status": probe(route)}))
 
 
 def make_event(observation):
@@ -253,16 +271,48 @@ def wake_message(folder, event):
     return (
         f"[watch-research-run event {event['event_id']}] 已登记任务到达需处理的状态。"
         f"先运行 `{command}` 确认原会话接手，然后读取 {state}、{result} 和其中的 PLAN.md。"
+        "回执写入失败时，报告原因并继续只读核对。"
         "按 watch-research-run 技能核实事实、权限和当前作业状态。"
         "根据原任务授权处理工程故障，科研协议变更先请用户确认，成功时按原计划验收和分析。"
         "通知传递任务事实，执行权限以原会话中的用户授权为准。"
     )
 
 
+def ensure_backend(route):
+    home = route.get("managed_home")
+    if home is not None:
+        try:
+            subprocess.run(
+                [route["codex"], "app-server", "daemon", "start"],
+                env={**os.environ, "CODEX_HOME": home}, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=25,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def check_model_route(url):
+    if not url:
+        return
+    try:
+        with urlopen(Request(url, method="HEAD"), timeout=8):
+            pass
+    except HTTPError:
+        # A response from the HTTPS origin proves transport, including when
+        # the request is unauthenticated. A failed proxy CONNECT raises URLError.
+        pass
+    except OSError as error:
+        raise Unavailable("The configured model endpoint is not reachable") from error
+
+
 def delivery(folder, task, event, seconds):
     route = task["route"]
+    if route is None:
+        return "recorded"
     delivery_path = folder / "delivery.json"
     deadline = time.monotonic() + seconds
+    retry_delay = 15
+    tried_start = False
     with locked(folder, "delivery.lock"):
         if (folder / "received.json").is_file():
             return "acknowledged"
@@ -270,47 +320,69 @@ def delivery(folder, task, event, seconds):
         if prior.get("state") in {"sending", "uncertain"}:
             return "uncertain"
         queued = prior.get("state") == "queued"
+        pending_reason = prior.get("detail")
         while True:
             try:
                 with AppServer(route) as server:
                     status = server.thread_status()
+            except Unavailable as error:
+                if not tried_start and route.get("managed_home") and time.monotonic() < deadline:
+                    tried_start = True
+                    ensure_backend(route)
+                    continue
+                unavailable = str(error)
+            else:
+                try:
+                    check_model_route(task.get("model_url"))
                     if queued:
                         if status == "notLoaded":
-                            server.request("thread/resume", {"threadId": route["thread"], "excludeTurns": True})
+                            with AppServer(route) as server:
+                                server.request("thread/resume", {"threadId": route["thread"], "excludeTurns": True})
+                        save_json(delivery_path, {**prior, "resume_warning": ""})
                         return "queued"
-            except Unavailable as error:
-                if time.monotonic() >= deadline:
-                    if not queued:
-                        save_json(delivery_path, {"state": "pending", "at": now(), "detail": str(error)})
-                    return "queued" if queued else "pending"
-                time.sleep(min(15, max(0, deadline - time.monotonic())))
-                continue
-            except WatchError as error:
-                if queued:
-                    save_json(delivery_path, {**prior, "resume_warning": str(error)})
-                    return "queued"
-                raise
+                except Unavailable as error:
+                    unavailable = str(error)
+                except WatchError as error:
+                    if queued:
+                        unavailable = str(error)
+                    else:
+                        raise
+                else:
+                    break
 
-            # Persist the attempt before enqueueing. An interrupted or ambiguous RPC
-            # is kept for inspection, since a repeated submission could start a second turn.
-            save_json(delivery_path, {"state": "sending", "at": now()})
-            try:
-                result = subprocess.run([
-                    route["codex"], "queue", "--remote", "unix://" + route["socket"],
-                    "--thread", route["thread"], "--resume", "--message", wake_message(folder, event),
-                ], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
-                receipt = re.search(r"Queued message (\S+) for thread (\S+)\.", result.stdout)
-                if result.returncode == 0 and receipt and receipt[2] == route["thread"]:
-                    warning = "\n".join(line for line in result.stderr.splitlines()
-                                        if "could not resume thread" in line.lower())
-                    save_json(delivery_path, {"state": "queued", "at": now(), "queue_id": receipt[1],
-                                              "resume_warning": warning[-1600:], "cli_stderr": result.stderr.strip()[-1600:]})
+            if (folder / "received.json").is_file():
+                return "acknowledged"
+            if not queued and pending_reason != unavailable:
+                save_json(delivery_path, {"state": "pending", "at": now(), "detail": unavailable})
+                pending_reason = unavailable
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if queued:
+                    save_json(delivery_path, {**prior, "resume_warning": unavailable})
                     return "queued"
-                detail = (result.stderr or result.stdout).strip()[-1600:]
-            except (OSError, subprocess.TimeoutExpired) as error:
-                detail = str(error)
-            save_json(delivery_path, {"state": "uncertain", "at": now(), "detail": detail})
-            return "uncertain"
+                return "pending"
+            time.sleep(min(retry_delay, remaining))
+            retry_delay = min(retry_delay * 2, 120)
+
+        # An ambiguous send stays on disk for inspection. Resubmitting could start a second turn.
+        save_json(delivery_path, {"state": "sending", "at": now()})
+        try:
+            result = subprocess.run([
+                route["codex"], "queue", "--remote", "unix://" + route["socket"],
+                "--thread", route["thread"], "--resume", "--message", wake_message(folder, event),
+            ], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+            receipt = re.search(r"Queued message (\S+) for thread (\S+)\.", result.stdout)
+            if result.returncode == 0 and receipt and receipt[2] == route["thread"]:
+                warning = "\n".join(line for line in result.stderr.splitlines()
+                                    if "could not resume thread" in line.lower())
+                save_json(delivery_path, {"state": "queued", "at": now(), "queue_id": receipt[1],
+                                          "resume_warning": warning[-1600:]})
+                return "queued"
+            detail = (result.stderr or result.stdout).strip()[-1600:]
+        except (OSError, subprocess.TimeoutExpired) as error:
+            detail = str(error)
+        save_json(delivery_path, {"state": "uncertain", "at": now(), "detail": detail})
+        return "uncertain"
 
 
 def dispatch(folder, task, event, seconds):
@@ -395,10 +467,10 @@ def wait_child(command):
 
 
 def monitor(args, command):
-    route = route_from(args)
-    # The origin has been probed while loaded, and a detached monitor may start
-    # after that turn ended. Check this endpoint and ID before taking ownership.
-    probe(route)
+    origin = origin_from(args)
+    route = None if args.record_only else route_from(args)
+    # Preflight belongs before submission. A socket outage here must not
+    # prevent us from recording an already submitted job's terminal evidence.
     folder = Path(args.state_dir).resolve()
     plan = Path(args.plan).resolve(strict=True)
     if not plan.is_file():
@@ -407,12 +479,14 @@ def monitor(args, command):
     with locked(folder, "watch.lock"):
         task_path = folder / "watch.json"
         event_path = folder / "event.json"
-        task = {"route": route, "plan": str(plan), "mode": args.action, "registered_at": now(),
-                "cwd": os.getcwd(), "job_id": getattr(args, "job_id", None)}
+        task = {"route": route, "thread": origin, "plan": str(plan), "mode": args.action, "registered_at": now(),
+                "cwd": os.getcwd(), "job_id": getattr(args, "job_id", None), "model_url": args.model_url}
         if task_path.exists():
             saved = read_json(task_path)
-            keys = ("mode", "route", "plan", "job_id")
-            if args.action != "slurm" or event_path.exists() or any(saved[key] != task[key] for key in keys):
+            keys = ("mode", "plan", "job_id")
+            saved_origin = saved.get("thread") or (saved["route"] or {}).get("thread")
+            if (args.action != "slurm" or event_path.exists() or saved_origin != origin
+                    or any(saved[key] != task[key] for key in keys)):
                 raise WatchError("This attempt already exists. Use deliver for a saved event or a new directory for a new attempt")
             task = saved
         else:
@@ -444,7 +518,8 @@ def acknowledge(args):
     task = read_json(folder / "watch.json")
     event = read_json(folder / "event.json")
     caller = thread_id(os.environ.get("CODEX_THREAD_ID"))
-    if caller != task["route"]["thread"] or args.event != event["event_id"]:
+    expected = task.get("thread") or (task["route"] or {}).get("thread")
+    if caller != expected or args.event != event["event_id"]:
         raise WatchError("Event ID or originating Codex thread does not match")
     with locked(folder, "ack.lock"):
         receipt = folder / "received.json"
@@ -457,19 +532,23 @@ def acknowledge(args):
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     routes = argparse.ArgumentParser(add_help=False)
-    routes.add_argument("--codex", default="codex")
-    routes.add_argument("--socket", required=True)
+    routes.add_argument("--codex", help="Override the Codex executable discovered on PATH")
+    routes.add_argument("--socket", help="Override the control socket of the current CODEX_HOME")
     routes.add_argument("--thread", default=os.environ.get("CODEX_THREAD_ID"))
     state = argparse.ArgumentParser(add_help=False)
     state.add_argument("--state-dir", required=True)
     handoff = argparse.ArgumentParser(add_help=False)
-    handoff.add_argument("--delivery-seconds", type=int, default=3600)
+    handoff.add_argument("--delivery-seconds", type=int, default=DELIVERY_SECONDS,
+                         help="Maximum seconds to wait for an available routing path")
+    registration = argparse.ArgumentParser(add_help=False)
+    registration.add_argument("--record-only", action="store_true", help="Save exit evidence for later review")
+    registration.add_argument("--model-url", help="Optional HTTPS model endpoint to check before queueing")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("probe", parents=[routes])
-    run = sub.add_parser("run", parents=[routes, state, handoff])
+    run = sub.add_parser("run", parents=[routes, state, handoff, registration])
     run.add_argument("--plan", required=True)
     run.add_argument("command", nargs=argparse.REMAINDER)
-    slurm = sub.add_parser("slurm", parents=[routes, state, handoff])
+    slurm = sub.add_parser("slurm", parents=[routes, state, handoff, registration])
     slurm.add_argument("--plan", required=True)
     slurm.add_argument("--job-id", required=True)
     slurm.add_argument("--poll-seconds", type=int, default=30)
@@ -485,6 +564,11 @@ def main():
     if getattr(args, "delivery_seconds", 0) < 0:
         parser.error("--delivery-seconds must be nonnegative")
     try:
+        if getattr(args, "model_url", None):
+            endpoint = urlsplit(args.model_url)
+            if (endpoint.scheme != "https" or not endpoint.hostname or endpoint.username is not None
+                    or endpoint.query or endpoint.fragment):
+                parser.error("--model-url requires an HTTPS URL without credentials, query, or fragment")
         if args.action == "probe":
             task_status(args)
         elif args.action == "ack":
