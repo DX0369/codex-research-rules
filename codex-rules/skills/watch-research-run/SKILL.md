@@ -21,21 +21,25 @@ description: 在用户要求托管预计约一小时以上、需要跨回合继�
 
 按这次任务的实际启动方式选择入口。同一台机器可同时运行调度任务和普通进程。
 
-- **Slurm 作业。** 先完成会话探测，再按授权提交。拿到确切 job ID 后，用原有后台机制运行 `slurm` 子命令，借助 `squeue` 与 `sacct` 获取真实终态。单一 `afterok` 依赖的分支可以在登记时传入 `--afterok-state-dir <直接上游的监控目录>`，使用同一计划和同一原会话，先登记上游。分支因上游失败取消且自身从未运行时，保留自己的终态，随上游事件处理。实际运行过的分支和归因不明的终态单独处理。接手已提交作业也使用这一入口。若监控中断且仍缺少终态，可对同一 job 和状态目录重新启动监控。数组或多阶段运行按计划登记所需的具体作业，完成时核对全部预期阶段。按需用 `--wait-limit` 限定等待。
+- **Slurm 作业。** 先完成会话探测，再按授权提交。拿到确切 job ID 后，用原有后台机制运行 `slurm` 子命令，借助 `squeue` 与 `sacct` 获取真实终态。已知单一 `afterok` 依赖时，先登记上游，再为分支传入 `--afterok-state-dir <直接上游的监控目录>`，使用同一计划和同一原会话。分支因上游失败取消且自身从未运行时，保留自己的终态，随上游事件处理。实际运行过的分支和归因不明的终态单独处理。接手已提交作业也使用这一入口。若监控中断且仍缺少终态，可对同一 job 和状态目录重新启动监控。数组或多阶段运行按计划登记所需的具体作业，完成时核对全部预期阶段。按需用 `--wait-limit` 限定等待。
 - **普通 Linux 进程。** 用 `run` 包住实际任务命令，由它等待子进程并记录退出码。外层根据现场可用能力继续使用 `screen`、`nohup`、`setsid` 或 `systemd-run --user`。用户级 systemd 需有可访问的用户服务管理器。只有 `nohup` 或 `setsid` 可用时，选可用的一种即可。项目 launcher 必须等实际工作结束，并把失败传播为非零退出状态。保留项目原有日志重定向和环境。使用管道时核对任务的真实退出状态。已经在跑且缺少终态记录的任务，依据日志和产物审计，证据不足时标记未知。
 
 ```bash
-python3 "$watch_script" slurm --plan "$plan_file" --state-dir "$attempt_dir" --job-id "$job_id"
+python3 "$watch_script" slurm --defer-notify --plan "$plan_file" --state-dir "$attempt_dir" --job-id "$job_id"
 
-watch_run=(python3 "$watch_script" run --plan "$plan_file" --state-dir "$attempt_dir" -- "${task_argv[@]}")
+watch_run=(python3 "$watch_script" run --defer-notify --plan "$plan_file" --state-dir "$attempt_dir" -- "${task_argv[@]}")
 nohup "${watch_run[@]}" >"$watch_log" 2>&1 </dev/null &
 ```
 
 `task_argv` 是原任务的命令与参数。使用其他后台机制时，将同一个 `"${watch_run[@]}"` 交给原启动入口。
 
-提交正式任务后确认 `watch.json` 和作业或进程标识，记录状态目录。用户要求跟到正常启动时，在原会话跟到计划中的首轮有效更新或首批有效产物，再交由后台托管。需要在排队或初始化期间离开时，主作业提前失败仍由后台通知原会话。短诊断、辅助探测和首轮检查用现有记录或 `--record-only`，由原会话结合主作业状态验收。
+## 启动验收与交接
 
-脚本先在 `event.json` 保存终态，再投递。`delivery.json` 的 `queued` 表示已入队，`received.json` 表示原会话已接手。依赖取消合并时，分支的 `delivery.json` 记录 `covered_by_upstream`，到其中指向的上游目录核对投递和回执。后台暂不可用时，脚本可启动已登记的官方后台，并在默认 24 小时内逐步放慢频率重试。重试到期后可用 `deliver --state-dir <目录>` 继续投递。遇到 `uncertain` 或 `sending` 时先查记录，避免重复触发。包装器异常消失且缺少终态时，先审计实际作业。
+- 正式任务默认按示例用 `--defer-notify` 登记。确认 `watch.json` 和实际作业或进程标识。当前回合负责启动期间的诊断和退出记录。短诊断、辅助探测和首轮检查使用现有记录或 `--record-only`。
+- 确认计划中的首轮有效更新或首批有效产物后，在原会话执行 `python3 "$watch_script" handoff --state-dir "$attempt_dir"`。提交成功或分到资源只用于确认作业归属。需要在排队或初始化时提前离开，给 `handoff` 加 `--early`。交接任务组时，逐个交接仍需后台处理的正式分支，使用各自状态目录。已经落盘且待处理的事件继续使用原监控投递。交接后可关闭客户端，保留原聊天供后台接续。
+- 已获授权并计划取消或替换 Slurm 作业时，在发出取消命令前，对每个确切作业执行 `python3 "$watch_script" expect-cancel --state-dir "$attempt_dir" --job-id "$job_id" --reason "<原因>"`。匹配的取消终态留档。已出现独立失败的作业或步骤按实际失败处理。
+
+脚本先在 `event.json` 保存终态。`handoff.json` 记录交接及启动验收状态。`delivery.json` 的 `queued` 表示已入队，`received.json` 表示原会话已接手。`planned_cancellation` 表示匹配已登记的取消。`covered_by_upstream` 指向统一处理的上游事件。后台暂不可用时，脚本可启动已登记的官方后台，并在默认 24 小时内逐步放慢频率重试。重试到期后可用 `deliver --state-dir <目录>` 继续投递。遇到 `uncertain` 或 `sending` 时先查记录，避免重复触发。包装器异常消失且缺少终态时，先审计实际作业。
 
 ## 原会话收到事件
 

@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+codex=$(command -v codex) || { printf '%s\n' 'codex-vscode: codex is missing from PATH' >&2; exit 127; }
+
+is_ide_server_start() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -c|--config) [ "$#" -ge 2 ] || return 1; shift 2 ;;
+            app-server)
+                shift
+                case "$*" in
+                    ""|--analytics-default-enabled|--telemetry-default-enabled) return 0 ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
+if ! is_ide_server_start "$@"; then
+    exec "$codex" "$@"
+fi
+
+websocat=$(command -v websocat) || { printf '%s\n' 'codex-vscode: websocat is missing from PATH' >&2; exit 127; }
+export CODEX_HOME="${CODEX_HOME:-"$HOME/.codex"}"
+control_socket=$CODEX_HOME/app-server-control/app-server-control.sock
+"$codex" app-server daemon start >&2
+
+# The editor reads one JSON message per line. Keep stdout for that stream.
+exec "$websocat" --text --exit-on-eof --buffer-size 8388608 \
+    --ws-c-uri ws://localhost/ - "ws-c:unix:$control_socket"

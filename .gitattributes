@@ -2,4 +2,6 @@
 *.json text eol=lf
 *.yaml text eol=lf
 *.py text eol=lf
+/integrations/vscode/codex-vscode text eol=lf
+LICENSE text eol=lf
 .gitattributes text eol=lf

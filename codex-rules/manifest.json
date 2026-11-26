@@ -1,19 +1,20 @@
 {
-  "version": "2026-11-26.3",
+  "version": "2026-11-26.4",
   "files": {
-    "AGENTS.md": "553a2076088d1a49eaf888b957d0e4852d55423e082e266f5a4d47f2aee4993b",
+    "AGENTS.md": "7fd57bda830f2ed03e41c51e35f939c84050848b3f0350b1ace39ff275a59297",
     "local-skills/codex-usage-review/SKILL.md": "f73b75cfa8a7ecc5cc5b673d74c0e1bace5594b5da65273498e2f727fb68a4ac",
-    "skills/audit-experiment-status/agents/openai.yaml": "1d94858c29ae8fa26ae26516acb2842c7901a14a2f428f051556f4856c51a3d2",
     "skills/audit-experiment-status/SKILL.md": "8942d48c8fcdc95985a44705798cd85565d4451e98fc5b008bd7768d348a9923",
-    "skills/handoff-research-project/SKILL.md": "fc6550db3ec37d0c8ad78ec06afd0e89c89be8b9ed47858a4d71fe023b1e9c22",
-    "skills/init-research-project-docs/agents/openai.yaml": "b51de4c9a95104fa835d49ed1f2135abcec1f287df9f57f1fae23af3401665b2",
+    "skills/audit-experiment-status/agents/openai.yaml": "1d94858c29ae8fa26ae26516acb2842c7901a14a2f428f051556f4856c51a3d2",
+    "skills/handoff-research-project/SKILL.md": "dd63ca4b5bdb89685af0641c39627d049c5ff37911575e7b3952b045bbe15f02",
     "skills/init-research-project-docs/SKILL.md": "178d5b7f081c8c1896b979f47d72740ed8a136328362fcbc749bb11188e9af35",
+    "skills/init-research-project-docs/agents/openai.yaml": "b51de4c9a95104fa835d49ed1f2135abcec1f287df9f57f1fae23af3401665b2",
     "skills/prepare-research-run/SKILL.md": "888ed6be19673e7c5a52a831aa53ad4054e3b8944224d9f7f79314981638e1c1",
     "skills/review-cleanup-candidates/SKILL.md": "42b4eacba9c6a08f00a5a374d7e369106075afd1a2dbf758d73b223aadf27105",
-    "skills/review-reproduction-feasibility/SKILL.md": "0aabe40fd080ecaeacfe4932f61b079be3d2733c785f1de9d48ec84e0ca821c3",
-    "skills/update-research-project-state/agents/openai.yaml": "ee6a5da925f32cafad3af8a5d100a2412bfd52c430864af393d8d20390c64330",
+    "skills/review-reproduction-feasibility/SKILL.md": "b22d374efdd99643b86656ebfa4f4930bcc0d324b5f1b2efee2de286ba03c0f8",
+    "skills/review-research-topic/SKILL.md": "bfd9e99d46853cabcffb30eb690cde92f706670f4dd72a4cf27d8f0bfdba6807",
     "skills/update-research-project-state/SKILL.md": "399f70786ff8241667c3dadb9b51ab3029b293fc355262a565868b69b3e58987",
-    "skills/watch-research-run/SKILL.md": "da8be172d084cafedc548f0383be0b95e9ddee93ce08106d099a3a958aa82343",
-    "skills/watch-research-run/scripts/watch.py": "0df35ccb6f3253b654910d40b531f43a9c3ff1961258799b1d50716465536285"
+    "skills/update-research-project-state/agents/openai.yaml": "ee6a5da925f32cafad3af8a5d100a2412bfd52c430864af393d8d20390c64330",
+    "skills/watch-research-run/SKILL.md": "77191a33abebc6a886e1b183b7ccb26211731e75d5892973ef02c9ee67a0ef60",
+    "skills/watch-research-run/scripts/watch.py": "62b1ef94fff479c7ecb18dcd2c342d6512b80be3cee35e6c2288e509834f0e7c"
   }
 }

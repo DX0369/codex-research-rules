@@ -268,13 +268,23 @@ def make_event(observation):
     return {"event_id": uuid.uuid4().hex, "observed_at": now(), **observation}
 
 
-def wake_message(folder, event):
+def wake_message(folder, event, verified_start):
     state = folder / "watch.json"
     result = folder / "event.json"
     command = shlex.join(["python3", str(Path(__file__).resolve()), "ack", "--state-dir", str(folder),
                           "--event", event["event_id"]])
+    if event["outcome"] == "process_succeeded":
+        headline = "任务已退出，等待结果验收。"
+    elif event["outcome"] == "unknown":
+        headline = "任务终态待核对。"
+    elif "spawn_error" in event:
+        headline = "任务启动失败，等待诊断。"
+    elif verified_start:
+        headline = "运行中断，等待诊断。"
+    else:
+        headline = "任务异常退出，等待核对启动或运行状态。"
     return (
-        f"[watch-research-run event {event['event_id']}] 已登记任务到达需处理的状态。"
+        f"[watch-research-run event {event['event_id']}] {headline}"
         f"先运行 `{command}` 确认原会话接手，然后读取 {state}、{result} 和其中的 PLAN.md。"
         "回执写入失败时，报告原因并继续只读核对。"
         "按 watch-research-run 技能核实事实、权限和当前作业状态。"
@@ -315,6 +325,10 @@ def delivery(folder, task, event, seconds):
     route = task["route"]
     if route is None:
         return "recorded"
+    handoff_path = folder / "handoff.json"
+    handoff = read_json(handoff_path) if handoff_path.is_file() else {}
+    if task.get("defer_notify") and not handoff:
+        return "awaiting_handoff"
     delivery_path = folder / "delivery.json"
     deadline = time.monotonic() + seconds
     retry_delay = 15
@@ -323,12 +337,21 @@ def delivery(folder, task, event, seconds):
         if (folder / "received.json").is_file():
             return "acknowledged"
         prior = read_json(delivery_path) if delivery_path.exists() else {}
-        if prior.get("state") == "covered_by_upstream":
+        if prior.get("state") in {"covered_by_upstream", "planned_cancellation"}:
             return prior["state"]
         if prior.get("state") in {"sending", "uncertain"}:
             return "uncertain"
         queued = prior.get("state") == "queued"
         if not queued:
+            cancellation = folder / "expected-cancel.json"
+            job = slurm_job(event, task.get("job_id"))
+            if (job.get("state") == "CANCELLED" and cancellation.is_file()
+                    and all(row["state"] in {"CANCELLED", "COMPLETED"} for row in event["slurm"])):
+                expected = read_json(cancellation)
+                if expected["job_id"] == job["job_id"]:
+                    save_json(delivery_path, {"state": "planned_cancellation", "at": now(),
+                                              "reason": expected["reason"]})
+                    return "planned_cancellation"
             upstream = upstream_failure(folder, task, event)
             if upstream:
                 upstream_dir, upstream_event = upstream
@@ -385,7 +408,8 @@ def delivery(folder, task, event, seconds):
         try:
             result = subprocess.run([
                 route["codex"], "queue", "--remote", "unix://" + route["socket"],
-                "--thread", route["thread"], "--resume", "--message", wake_message(folder, event),
+                "--thread", route["thread"], "--resume",
+                "--message", wake_message(folder, event, handoff.get("verified_start", False)),
             ], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
             receipt = re.search(r"Queued message (\S+) for thread (\S+)\.", result.stdout)
             if result.returncode == 0 and receipt and receipt[2] == route["thread"]:
@@ -579,6 +603,8 @@ def monitor(args, command):
         event_path = folder / "event.json"
         task = {"route": route, "thread": origin, "plan": str(plan), "mode": args.action, "registered_at": now(),
                 "cwd": os.getcwd(), "job_id": getattr(args, "job_id", None), "model_url": args.model_url}
+        if args.defer_notify:
+            task["defer_notify"] = True
         if args.action == "slurm":
             task["poll_seconds"] = args.poll_seconds
             if args.afterok_state_dir:
@@ -619,19 +645,63 @@ def replay(args):
     return int(state not in {"queued", "acknowledged"})
 
 
-def acknowledge(args):
-    folder = Path(args.state_dir).resolve(strict=True)
+def originating_attempt(state_dir):
+    folder = Path(state_dir).resolve(strict=True)
     task = read_json(folder / "watch.json")
-    event = read_json(folder / "event.json")
     caller = thread_id(os.environ.get("CODEX_THREAD_ID"))
     expected = task.get("thread") or (task["route"] or {}).get("thread")
-    if caller != expected or args.event != event["event_id"]:
-        raise WatchError("Event ID or originating Codex thread does not match")
+    if caller != expected:
+        raise WatchError("The originating Codex thread does not match")
+    return folder, task
+
+
+def hand_off(args):
+    folder, task = originating_attempt(args.state_dir)
+    if not task.get("defer_notify") or not task["route"]:
+        raise WatchError("Handoff requires an attempt registered with --defer-notify")
+    with locked(folder, "handoff.lock"):
+        marker = folder / "handoff.json"
+        previous = read_json(marker) if marker.is_file() else {}
+        if not previous or (not args.early and not previous.get("verified_start")):
+            save_json(marker, {"at": now(), "verified_start": not args.early})
+    # The monitor writes the event first and then checks the marker. Handoff
+    # writes the marker first and then checks the event. Either side can send.
+    event_path = folder / "event.json"
+    if event_path.is_file():
+        try:
+            state = dispatch(folder, task, read_json(event_path), args.delivery_seconds)
+        except WatchInUse:
+            state = "in_progress"
+        return int(state not in {"queued", "acknowledged", "planned_cancellation", "in_progress"})
+    print(json.dumps({"state_dir": str(folder), "delivery": "enabled"}), flush=True)
+    return 0
+
+
+def expect_cancel(args):
+    folder, task = originating_attempt(args.state_dir)
+    if task.get("mode") != "slurm" or task["job_id"] != args.job_id:
+        raise WatchError("The registered Slurm job ID does not match")
+    reason = args.reason.strip()
+    if not reason:
+        raise WatchError("A planned cancellation requires a reason")
+    with locked(folder, "handoff.lock"):
+        if (folder / "event.json").is_file():
+            raise WatchError("This attempt already has a terminal event")
+        save_json(folder / "expected-cancel.json", {"job_id": args.job_id, "reason": reason, "at": now()})
+    print(json.dumps({"job_id": args.job_id, "state": "planned_cancellation_registered"}))
+
+
+def acknowledge(args):
+    folder, task = originating_attempt(args.state_dir)
+    event = read_json(folder / "event.json")
+    if args.event != event["event_id"]:
+        raise WatchError("Event ID does not match")
     with locked(folder, "ack.lock"):
         receipt = folder / "received.json"
         newly_received = not receipt.exists()
         if newly_received:
-            save_json(receipt, {"thread": caller, "event_id": args.event, "acknowledged_at": now()})
+            save_json(receipt, {"thread": task.get("thread") or task["route"]["thread"],
+                                "event_id": args.event, "acknowledged_at": now()})
     print(json.dumps({"acknowledged": True, "first_ack": newly_received, "event_id": args.event}))
 
 
@@ -647,7 +717,9 @@ def arguments():
     handoff.add_argument("--delivery-seconds", type=int, default=DELIVERY_SECONDS,
                          help="Maximum seconds to wait for an available routing path")
     registration = argparse.ArgumentParser(add_help=False)
-    registration.add_argument("--record-only", action="store_true", help="Save exit evidence for later review")
+    notification = registration.add_mutually_exclusive_group()
+    notification.add_argument("--record-only", action="store_true", help="Save exit evidence for later review")
+    notification.add_argument("--defer-notify", action="store_true", help="Record evidence; enable delivery with handoff")
     registration.add_argument("--model-url", help="Optional HTTPS model endpoint to check before queueing")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("probe", parents=[routes])
@@ -661,6 +733,11 @@ def arguments():
     slurm.add_argument("--wait-limit", type=int, default=0, help="Maximum seconds to watch, or 0 to wait for a terminal record")
     slurm.add_argument("--afterok-state-dir", help="State directory of this job's single direct Slurm afterok prerequisite")
     sub.add_parser("deliver", parents=[state, handoff])
+    arm = sub.add_parser("handoff", parents=[state, handoff], help="Enable delivery for a deferred attempt")
+    arm.add_argument("--early", action="store_true", help="Hand off before the first verified progress")
+    cancel = sub.add_parser("expect-cancel", parents=[state], help="Record an authorized Slurm cancellation")
+    cancel.add_argument("--job-id", required=True)
+    cancel.add_argument("--reason", required=True)
     ack = sub.add_parser("ack", parents=[state])
     ack.add_argument("--event", required=True)
     return parser, parser.parse_args()
@@ -682,6 +759,10 @@ def main():
             acknowledge(args)
         elif args.action == "deliver":
             return replay(args)
+        elif args.action == "handoff":
+            return hand_off(args)
+        elif args.action == "expect-cancel":
+            expect_cancel(args)
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
