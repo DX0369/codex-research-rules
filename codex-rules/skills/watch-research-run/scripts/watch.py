@@ -34,8 +34,13 @@ class Unavailable(WatchError):
     pass
 
 
+class WatchInUse(WatchError):
+    pass
+
+
 DELIVERY_SECONDS = 24 * 60 * 60
 CONTROL_SOCKET = "app-server-control/app-server-control.sock"
+SLURM_POLL_SECONDS = 30
 
 
 def now():
@@ -66,7 +71,7 @@ def locked(folder, name):
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise WatchError(f"Already in use: {folder / name}") from error
+            raise WatchInUse(f"Already in use: {folder / name}") from error
         yield
 
 
@@ -273,6 +278,7 @@ def wake_message(folder, event):
         f"先运行 `{command}` 确认原会话接手，然后读取 {state}、{result} 和其中的 PLAN.md。"
         "回执写入失败时，报告原因并继续只读核对。"
         "按 watch-research-run 技能核实事实、权限和当前作业状态。"
+        "有已登记的依赖作业时，一并核对它们的终态。"
         "根据原任务授权处理工程故障，科研协议变更先请用户确认，成功时按原计划验收和分析。"
         "通知传递任务事实，执行权限以原会话中的用户授权为准。"
     )
@@ -317,9 +323,19 @@ def delivery(folder, task, event, seconds):
         if (folder / "received.json").is_file():
             return "acknowledged"
         prior = read_json(delivery_path) if delivery_path.exists() else {}
+        if prior.get("state") == "covered_by_upstream":
+            return prior["state"]
         if prior.get("state") in {"sending", "uncertain"}:
             return "uncertain"
         queued = prior.get("state") == "queued"
+        if not queued:
+            upstream = upstream_failure(folder, task, event)
+            if upstream:
+                upstream_dir, upstream_event = upstream
+                save_json(delivery_path, {"state": "covered_by_upstream", "at": now(),
+                                          "upstream_state_dir": str(upstream_dir),
+                                          "upstream_event_id": upstream_event["event_id"]})
+                return "covered_by_upstream"
         pending_reason = prior.get("detail")
         while True:
             try:
@@ -386,8 +402,34 @@ def delivery(folder, task, event, seconds):
 
 
 def dispatch(folder, task, event, seconds):
-    state = delivery(folder, task, event, seconds)
-    print(json.dumps({"event_id": event["event_id"], "delivery": state, "state_dir": str(folder)}), flush=True)
+    report = {"event_id": event["event_id"], "state_dir": str(folder)}
+    visited = {folder}
+    while True:
+        try:
+            state = delivery(folder, task, event, seconds)
+        except WatchInUse:
+            if len(visited) == 1:
+                raise
+            state = "in_progress"
+        if state != "covered_by_upstream":
+            break
+        link = read_json(folder / "delivery.json")
+        folder = Path(link["upstream_state_dir"])
+        if folder in visited:
+            raise WatchError("Circular upstream notification record")
+        visited.add(folder)
+        upstream_task = read_json(folder / "watch.json")
+        event = read_json(folder / "event.json")
+        if not matches_upstream(task, upstream_task) or event["event_id"] != link["upstream_event_id"]:
+            raise WatchError("The recorded upstream notification no longer matches")
+        task = upstream_task
+        report.update(delivery="covered_by_upstream", upstream_state_dir=str(folder),
+                      upstream_event_id=event["event_id"])
+    if len(visited) == 1:
+        report["delivery"] = state
+    else:
+        report["upstream_delivery"] = state
+    print(json.dumps(report), flush=True)
     return state
 
 
@@ -405,16 +447,18 @@ def slurm_terminal(job):
         raise WatchError(f"squeue: {active.stderr.strip()[-500:]}")
     if active.stdout.strip():
         return None
-    accounting = external(["sacct", "-n", "-P", "-j", job, "-o", "JobID%64,State%42,ExitCode,DerivedExitCode"])
+    accounting = external(["sacct", "-n", "-P", "-j", job, "-o",
+                           "JobID%64,State%42,ExitCode,DerivedExitCode,AllocTRES%250,ElapsedRaw,End"])
     if accounting.returncode != 0:
         raise WatchError(f"sacct: {accounting.stderr.strip()[-500:]}")
     rows = []
     for line in accounting.stdout.splitlines():
         fields = line.strip().split("|")
-        if len(fields) == 4 and (fields[0] == job or fields[0].startswith(job + ".")):
-            name, state, status, derived = fields
+        if len(fields) == 7 and (fields[0] == job or fields[0].startswith(job + ".")):
+            name, state, status, derived, allocation, elapsed, end = fields
             rows.append({"job_id": name, "state": state.split(maxsplit=1)[0] if state else "",
-                         "exit_code": status, "derived_exit_code": derived})
+                         "exit_code": status, "derived_exit_code": derived, "state_detail": state,
+                         "allocation": allocation, "elapsed_seconds": elapsed, "end": end})
     jobs = [row for row in rows if row["job_id"] == job]
     if len(jobs) != 1 or any(row["state"] not in TERMINAL for row in rows):
         return None
@@ -423,6 +467,60 @@ def slurm_terminal(job):
     success = all(row["state"] == "COMPLETED" and row["exit_code"] == "0:0"
                   and row["derived_exit_code"] in {"", "0:0"} for row in rows)
     return {"outcome": "process_succeeded" if success else "failed_or_stopped", "slurm": rows}
+
+
+def matches_upstream(task, upstream):
+    route = task.get("route") or {}
+    parent_route = upstream.get("route") or {}
+    return (upstream.get("mode") == "slurm" and upstream.get("plan") == task["plan"]
+            and upstream.get("job_id") != task.get("job_id") and bool(parent_route)
+            and parent_route["thread"] == route.get("thread") and parent_route["socket"] == route.get("socket"))
+
+
+def slurm_job(event, job_id):
+    return next((row for row in event.get("slurm", ()) if row["job_id"] == job_id), {})
+
+
+def failed_before(event, job_id, child_end):
+    job = slurm_job(event, job_id)
+    end = job.get("end", "")
+    return (job.get("state") in TERMINAL and job["state"] != "COMPLETED"
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", end) and end <= child_end)
+
+
+def upstream_failure(folder, task, event):
+    """Find the existing event that accounts for an unused afterok branch."""
+    root = None
+    visited = {folder}
+    while task.get("afterok_state_dir"):
+        job = slurm_job(event, task.get("job_id"))
+        end = job.get("end", "")
+        if (len(event.get("slurm", ())) != 1 or job.get("state_detail") != "CANCELLED"
+                or job.get("allocation") != "" or job.get("elapsed_seconds") != "0"
+                or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", end)):
+            break
+        parent = Path(task["afterok_state_dir"])
+        if parent in visited:
+            break
+        try:
+            upstream = read_json(parent / "watch.json")
+            if not matches_upstream(task, upstream):
+                break
+            parent_event = parent / "event.json"
+            if not parent_event.is_file():
+                # Slurm may account for the child before the upstream watcher saves its event.
+                deadline = time.monotonic() + 2 * upstream.get("poll_seconds", SLURM_POLL_SECONDS)
+                while not parent_event.is_file() and time.monotonic() < deadline:
+                    time.sleep(min(2, max(0, deadline - time.monotonic())))
+            observed = read_json(parent_event)
+            if not failed_before(observed, upstream["job_id"], end):
+                break
+        except (OSError, ValueError, KeyError):
+            break
+        visited.add(parent)
+        root = (parent, observed)
+        task, event = upstream, observed
+    return root
 
 
 def monitor_slurm(job, interval, wait_limit):
@@ -481,12 +579,20 @@ def monitor(args, command):
         event_path = folder / "event.json"
         task = {"route": route, "thread": origin, "plan": str(plan), "mode": args.action, "registered_at": now(),
                 "cwd": os.getcwd(), "job_id": getattr(args, "job_id", None), "model_url": args.model_url}
+        if args.action == "slurm":
+            task["poll_seconds"] = args.poll_seconds
+            if args.afterok_state_dir:
+                upstream = Path(args.afterok_state_dir).resolve()
+                if upstream == folder:
+                    raise WatchError("The upstream monitor must have its own state directory")
+                task["afterok_state_dir"] = str(upstream)
         if task_path.exists():
             saved = read_json(task_path)
             keys = ("mode", "plan", "job_id")
             saved_origin = saved.get("thread") or (saved["route"] or {}).get("thread")
             if (args.action != "slurm" or event_path.exists() or saved_origin != origin
-                    or any(saved[key] != task[key] for key in keys)):
+                    or any(saved[key] != task[key] for key in keys)
+                    or (task.get("afterok_state_dir") and task["afterok_state_dir"] != saved.get("afterok_state_dir"))):
                 raise WatchError("This attempt already exists. Use deliver for a saved event or a new directory for a new attempt")
             task = saved
         else:
@@ -551,8 +657,9 @@ def arguments():
     slurm = sub.add_parser("slurm", parents=[routes, state, handoff, registration])
     slurm.add_argument("--plan", required=True)
     slurm.add_argument("--job-id", required=True)
-    slurm.add_argument("--poll-seconds", type=int, default=30)
+    slurm.add_argument("--poll-seconds", type=int, default=SLURM_POLL_SECONDS)
     slurm.add_argument("--wait-limit", type=int, default=0, help="Maximum seconds to watch, or 0 to wait for a terminal record")
+    slurm.add_argument("--afterok-state-dir", help="State directory of this job's single direct Slurm afterok prerequisite")
     sub.add_parser("deliver", parents=[state, handoff])
     ack = sub.add_parser("ack", parents=[state])
     ack.add_argument("--event", required=True)
