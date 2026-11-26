@@ -44,7 +44,7 @@
 | 客户端 | 连接方式 |
 | --- | --- |
 | Codex 桌面 App | 使用 [官方 SSH 连接](https://learn.chatgpt.com/docs/remote-connections#connect-to-an-ssh-host)，在目标服务器的原聊天登记。 |
-| VS Code Remote-SSH | 使用 [可选启动器](integrations/vscode/README.md)，连接可接续该聊天的官方 Codex 后台。 |
+| VS Code Remote-SSH | 在日常 VS Code 中通过可选启动器接入服务器的官方 Codex 后台。Windows 本地窗口可用同名启动器调用扩展随附的 CLI。[安装与复验](integrations/vscode/README.md) |
 
 在目标 Linux 聊天里让 Codex 运行 `watch.py probe`。这是本仓库监控脚本的探测命令。验证通过后，可以把下面这句发给 Codex。
 
